@@ -13,6 +13,9 @@ import scala.concurrent.duration.Duration
 import java.util.concurrent.TimeUnit
 import java.io.PrintWriter
 import java.io.File
+import akka.actor.Identify
+import akka.actor.ActorIdentity
+import akka.actor.Terminated
 
 case object Start
 case object Stop
@@ -28,66 +31,80 @@ case object SendMessage
 case class Deliver(msg: String)
 //case class Forward(key: Int, sender: Int, msg: String, path: Array[Int], msgCount: Int)
 case class Forward(key: Int, sender: Int, msg: String, msgCount: Int, numHops: Int)
+case class NodeDead(key: Int, sender: Int, msg: String, msgCount: Int, numHops: Int)
 //case class MessageDelivered(path: Array[Int], msgCount: Int)
 case class MessageDelivered(numHops: Int, msgCount: Int)
-case class MessagingComplete(numHops: Double)
+case class MessagingComplete(numHops: Double, numRequests: Int)
 case object PrintState
+case object FailNode
+case object RequestForLeafSet
+case object RequestForRoutingTable
+case class UpdateLeafSet(nodeState: PastryNodeState)
+case class UpdateRoutingTable(nodeState: PastryNodeState)
 
-object Project3 {
-  val DEFAULT_NUM_NODES:Int = 1000
-  val DEFAULT_NUM_REQUESTS:Int = 10
-  
+//TODO - dead node removed from leafset and routing table
+//updating leafset and routing table with new live node
+object Project_Bonus {
+  val DEFAULT_NUM_NODES: Int = 1000
+  val DEFAULT_NUM_REQUESTS: Int = 10
+  val DEFAULT_NUM_FAILURES: Int = 0
+
   def main(args: Array[String]) {
-    var (numNodes, numRequests) = try {
-      (args(0).toInt, args(1).toInt)
+    var (numNodes, numRequests, numFailures) = try {
+      (args(0).toInt, args(1).toInt, args(2).toInt)
     } catch {
       case ex: Exception => {
-        println("Invalid input arguments !!!\nRunning with default configuration (numNodes=1000, numRequest=10)")
-        (DEFAULT_NUM_NODES, DEFAULT_NUM_REQUESTS)
+        println("Invalid input arguments !!!\nRunning with default configuration (numNodes=1000, numRequest=10, numFailures=0)")
+        (DEFAULT_NUM_NODES, DEFAULT_NUM_REQUESTS, DEFAULT_NUM_FAILURES)
       }
     }
-    
-    if(numNodes < 2 || numRequests < 1){
-    	println("Invalid input arguments !!!\nRunning with default configuration (numNodes=1000, numRequest=10)")
-    	numNodes = DEFAULT_NUM_NODES
-    	numRequests = DEFAULT_NUM_REQUESTS
-    }
-    
-    println(numNodes + " " + numRequests)
 
-    startPastry(numNodes, numRequests)
+    if (numNodes < 2 || numRequests < 1 || (numFailures < 0 && numFailures > numNodes)) {
+      println("Invalid input arguments !!!\nRunning with default configuration (numNodes=1000, numRequest=10, numFailures=0)")
+      numNodes = DEFAULT_NUM_NODES
+      numRequests = DEFAULT_NUM_REQUESTS
+    }
+
+    println(numNodes + " " + numRequests + " " + numFailures)
+
+    startPastry(numNodes, numRequests, numFailures)
   }
 
-  def startPastry(numNodes: Int, numRequests: Int) {
+  def startPastry(numNodes: Int, numRequests: Int, numFailures: Int) {
     val system = ActorSystem("pastry")
-    val master = system.actorOf(Props(classOf[Master], numNodes, numRequests), name = "master")
+    val master = system.actorOf(Props(classOf[Master], numNodes, numRequests, numFailures), name = "master")
 
     println("Starting Master")
     master ! Start
   }
 }
 
-class Master(pNumNodes: Int, pNumRequests: Int) extends Actor {
+class Master(pNumNodes: Int, pNumRequests: Int, numFailures: Int) extends Actor {
   val numNodes = pNumNodes
   val numRequests = pNumRequests
-  var networkNodes: Array[Int] = new Array(numNodes) //array buffer of size numNodes
+  //var networkNodes: Array[Int] = new Array(numNodes) //array buffer of size numNodes
+  var networkNodes: Array[ActorRef] = new Array(numNodes) //array of size numNodes
   var joinCount = 1
   var msgCount = 0
+  var numFailedNodes = 0
   var totalHops: Double = 0.0
+  var totalRequests: Int = 0
+  var scheduler: Cancellable = null
 
   def receive = {
     case Start => {
       for (i <- 0 until numNodes) {
         var randomId = NodeId.randomId
-        networkNodes(i) = randomId
-        context.actorOf(Props(classOf[PastryNode], randomId), name = randomId.toString)
+        //networkNodes(i) = randomId
+        networkNodes(i) = context.actorOf(Props(classOf[PastryNode], randomId), name = randomId.toString)
       }
       //println("Network nodes created: " + Arrays.toString(networkNodes))
       println("Network nodes created")
 
       println("Starting nodes")
       //println("First node started by default. Starting second node")
-      context.actorSelection(networkNodes(1).toString) ! StartJoin(networkNodes(0))
+      //context.actorSelection(networkNodes(1).toString) ! StartJoin(networkNodes(0))
+      networkNodes(1) ! StartJoin(networkNodes(0).path.name.toInt)
     }
 
     case JoinFinished => {
@@ -96,23 +113,40 @@ class Master(pNumNodes: Int, pNumRequests: Int) extends Actor {
       if (joinCount == numNodes) {
         //joinCount = 0
 
-        //networkNodes.foreach(nodeId => context.actorSelection(nodeId.toString) ! PrintState)
+        //networkNodes.foreach(nodeId => nodeId ! PrintState)
 
         println("Network join complete for nodes. Starting Messaging")
-        networkNodes.foreach(nodeId => context.actorSelection(nodeId.toString) ! StartMessaging(numRequests))
+        //networkNodes.foreach(nodeId => context.actorSelection(nodeId.toString) ! StartMessaging(numRequests))
+        networkNodes.foreach(nodeId => nodeId ! StartMessaging(numRequests))
+
+        startFailingNodes()
       } else if (joinCount < numNodes) {
         //println("Starting node number" + (count + 1))
-        context.actorSelection(networkNodes(joinCount).toString) ! StartJoin(networkNodes(joinCount - 1))
+        //context.actorSelection(networkNodes(joinCount).toString) ! StartJoin(networkNodes(joinCount - 1))
+        networkNodes(joinCount) ! StartJoin(networkNodes(joinCount - 1).path.name.toInt)
       }
     }
 
-    case MessagingComplete(numHops) => {
+    case MessagingComplete(numHops, numRequests) => {
       msgCount += 1
       totalHops += numHops
+      totalRequests += numRequests
 
       if (msgCount == numNodes) {
-        println("Overall Average: " + (totalHops / (numNodes * numRequests)))
+        //println("Overall Average: " + (totalHops / (numNodes * numRequests)))
+        println("Overall Average: " + (totalHops / totalRequests))
         context.system.shutdown
+      }
+    }
+
+    case FailNode => {
+      var rand = new Random
+
+      if (numFailedNodes < numFailures) {
+        var randNum = rand.nextInt(numNodes)
+        //context.stop(networkNodes(randNum))
+        networkNodes(randNum) ! Stop
+        numFailedNodes += 1
       }
     }
 
@@ -122,13 +156,21 @@ class Master(pNumNodes: Int, pNumRequests: Int) extends Actor {
 
     case _ => {
       println("Unexpected Message !!!")
-      context.system.shutdown
+      //context.system.shutdown
     }
+  }
+
+  def startFailingNodes() {
+
+    val system = context.system
+    import system.dispatcher
+    scheduler = system.scheduler.schedule(Duration(100, TimeUnit.MILLISECONDS), Duration(100, TimeUnit.MILLISECONDS), self, FailNode)
   }
 }
 
 class PastryNode(pNodeId: Int) extends Actor {
   val nodeId = pNodeId
+  var isAlive = true
   var pathToClosestNode: Array[Int] = Array.emptyIntArray
   //Array to store nodeIds which this node has already sent welcome message to
   var welcomeNodeList: Array[Int] = Array.emptyIntArray
@@ -148,9 +190,21 @@ class PastryNode(pNodeId: Int) extends Actor {
   nodeState.initializeState(nodeId)
 
   def receive = {
+    case ActorIdentity(_, Some(actorRef)) => {
+      context watch actorRef
+    }
+
+    case ActorIdentity(_, None) => { // not alive
+
+    }
+
+    case Terminated(node) => { // ...
+      //nodeState.removeNodeFromStateTables((node.path.name).toInt)
+    }
+
     case StartJoin(neighbourKey) => {
       // println(nodeId + " started join with neighbour " + neighbourKey)
-      context.actorSelection("../" + neighbourKey.toString) ! Join(nodeId) //0 means first join message to nearest neighbour
+      context.actorSelection("../" + neighbourKey.toString) ! Join(nodeId)
     }
 
     case Join(key) => {
@@ -214,6 +268,9 @@ class PastryNode(pNodeId: Int) extends Actor {
       //nodeState.printState()
 
       pathToClosestNode.foreach(nodeId => context.actorSelection("../" + nodeId.toString) ! UpdateState(nodeState))
+
+      //set death watch for all nodes in leafset and routing table
+      //setWatch()
     }
 
     case StartMessaging(pNumMsgs) => {
@@ -241,7 +298,7 @@ class PastryNode(pNodeId: Int) extends Actor {
           if (msgDeliveredCount == numMsgs) {
             var avgHops = avg(numHopsList)
             println("Avg. number of hops for " + nodeId + ": " + avgHops)
-            context.parent ! MessagingComplete(avgHops * numMsgs)
+            context.parent ! MessagingComplete(avgHops * numMsgs, numMsgs)
           }
         } else {
           //var path: Array[Int] = Array(nodeId)
@@ -258,32 +315,73 @@ class PastryNode(pNodeId: Int) extends Actor {
     case Forward(key, senderId, msg, msgCount, numHops) => {
       //println(nodeId + " received msg" + msgCount + " from " + sender.path.name + " for delivering to " + key)
       //println("Delivery Path for "+key+" : " + Arrays.toString(path))
-      if (senderId == nodeId) {
-        //finished
-        numHopsList(msgCount) = 0
-        msgDeliveredCount += 1
-        if (msgDeliveredCount == numMsgs) {
-          var avgHops = avg(numHopsList)
-          println("Avg. number of hops for " + nodeId + ": " + avgHops)
-          context.parent ! MessagingComplete(avgHops * numMsgs)
-        }
-      } else if (msgNodeList.contains((senderId, msgCount))) {
-        //finished
-        //println(senderId + " delivered msg" + msgCount + " to " + key + " on path: " + Arrays.toString(path))
-        context.actorSelection("../" + senderId.toString) ! MessageDelivered(numHops, msgCount)
-      } else {
-        //var newPath: Array[Int] = path.clone
-        //newPath +:= nodeId
-        msgNodeList +:= (senderId, msgCount)
-        var closestNodeId = nodeState.nextNode(key)
-        if (closestNodeId == nodeId) {
+      if (isAlive) {
+        if (senderId == nodeId) {
           //finished
-          //println(senderId + " delivered msg" + msgCount + " to " + key + " on path: " + Arrays.toString(newPath))
-          context.actorSelection("../" + senderId.toString) ! MessageDelivered(numHops + 1, msgCount)
+          numHopsList(msgCount) = 0
+          msgDeliveredCount += 1
+          if (msgDeliveredCount == numMsgs) {
+            var avgHops = avg(numHopsList)
+            println("Avg. number of hops for " + nodeId + ": " + avgHops)
+            context.parent ! MessagingComplete(avgHops * numMsgs, numMsgs)
+          }
+        } else if (msgNodeList.contains((senderId, msgCount))) {
+          //finished
+          //println(senderId + " delivered msg" + msgCount + " to " + key + " on path: " + Arrays.toString(path))
+          context.actorSelection("../" + senderId.toString) ! MessageDelivered(numHops, msgCount)
         } else {
-          context.actorSelection("../" + closestNodeId.toString) ! Forward(key, senderId, msg, msgCount, numHops + 1)
+          //var newPath: Array[Int] = path.clone
+          //newPath +:= nodeId
+          msgNodeList +:= (senderId, msgCount)
+          var closestNodeId = nodeState.nextNode(key)
+          if (closestNodeId == nodeId) {
+            //finished
+            //println(senderId + " delivered msg" + msgCount + " to " + key + " on path: " + Arrays.toString(newPath))
+            context.actorSelection("../" + senderId.toString) ! MessageDelivered(numHops + 1, msgCount)
+          } else {
+            context.actorSelection("../" + closestNodeId.toString) ! Forward(key, senderId, msg, msgCount, numHops + 1)
+          }
         }
+      } else {
+        //send it back to sender
+        sender ! NodeDead(key, senderId, msg, msgCount, numHops + 1)
       }
+    }
+
+    case NodeDead(key, senderId, msg, msgCount, numHops) => {
+      var senderNodeId: Int = sender.path.name.toInt
+      val (askLeafSetFromNode, askRoutingTableFromNode) = nodeState.removeDeadNodeAndUpdateState(senderNodeId)
+
+      if (askLeafSetFromNode != 0)
+        context.actorSelection("../" + askLeafSetFromNode.toString) ! RequestForLeafSet
+
+      if (askRoutingTableFromNode != 0)
+        context.actorSelection("../" + askRoutingTableFromNode.toString) ! RequestForRoutingTable
+
+      var closestNodeId = nodeState.nextNode(key)
+      if (closestNodeId == nodeId) {
+        //finished
+        //println(senderId + " delivered msg" + msgCount + " to " + key + " on path: " + Arrays.toString(newPath))
+        context.actorSelection("../" + senderId.toString) ! MessageDelivered(numHops + 1, msgCount)
+      } else {
+        context.actorSelection("../" + closestNodeId.toString) ! Forward(key, senderId, msg, msgCount, numHops + 1)
+      }
+    }
+
+    case RequestForLeafSet => {
+      sender ! UpdateLeafSet(nodeState)
+    }
+
+    case RequestForRoutingTable => {
+      sender ! UpdateRoutingTable(nodeState)
+    }
+
+    case UpdateLeafSet(pNodeState) => {
+      nodeState.updateLeafSet(pNodeState)
+    }
+
+    case UpdateRoutingTable(pNodeState) => {
+      nodeState.updateRoutingTable(pNodeState, Constants.numRows)
     }
 
     //case MessageDelivered(path, msgCount) => {
@@ -296,7 +394,7 @@ class PastryNode(pNodeId: Int) extends Actor {
         if (msgDeliveredCount == numMsgs) {
           var avgHops = avg(numHopsList)
           println("Avg. number of hops for " + nodeId + ": " + avgHops)
-          context.parent ! MessagingComplete(avgHops * numMsgs)
+          context.parent ! MessagingComplete(avgHops * numMsgs, numMsgs)
         }
       }
     }
@@ -306,7 +404,16 @@ class PastryNode(pNodeId: Int) extends Actor {
     }
 
     case Stop => {
-      context.system.shutdown
+      //context.system.shutdown
+      if (isAlive) {
+        isAlive = false
+        scheduler.cancel()
+        if (msgDeliveredCount < numMsgs) {
+          var avgHops = avg(numHopsList)
+          println("Avg. number of hops for " + nodeId + ": " + avgHops+" ("+msgDeliveredCount+")")
+          context.parent ! MessagingComplete(avgHops * msgDeliveredCount, msgDeliveredCount)
+        }
+      }
     }
 
     case _ => {
@@ -320,6 +427,24 @@ class PastryNode(pNodeId: Int) extends Actor {
     numList.foreach(x => sum += x)
 
     return (sum / numList.length)
+  }
+
+  def setWatch() {
+    nodeState.smallerLeafSet.foreach(nodeId =>
+      context.actorSelection("../" + nodeId._1.toString) ! Identify(None))
+
+    nodeState.largerLeafSet.foreach(nodeId =>
+      context.actorSelection("../" + nodeId._1.toString) ! Identify(None))
+
+    var rt = nodeState.routingTable
+    for (i <- 0 until Constants.numRows) {
+      for (j <- 0 until Constants.numCols) {
+        var nodeId = rt(i)(j)
+        if (nodeId != null) {
+          context.actorSelection("../" + nodeId._1.toString) ! Identify(None)
+        }
+      }
+    }
   }
 }
 
@@ -349,76 +474,78 @@ class PastryNodeState(pNodeId: Int) {
     }
   }
 
-  def initializeLeafSet(pSmallerLeafSet: Array[Tuple2[Int, Int]], pLargerLeafSet: Array[Tuple2[Int, Int]], closestNodeId: Int) {
-    //initializing leafset using the leafset of the closest node
-    var index: Int = -1
-    val proximityToClosestNode = (Math.abs(nodeId - closestNodeId)).toInt
+  def removeNodeFromLeafSet(key: Int): Int = {
+    val diff = Math.abs(key - nodeId)
+    var existInLeafSet = false
+    var askLeafSetFromNode: Int = 0
 
-    //updating smaller leafset
-    for (i <- 0 until lenSmallerLeafSet) {
-      var leafId = pSmallerLeafSet(i)
+    //removing node from leafset if exists
+    if (smallerLeafSet.contains((key, diff))) {
+      smallerLeafSet = smallerLeafSet diff List((key, diff))
+      lenSmallerLeafSet -= 1
+      existInLeafSet = true
+    } else if (largerLeafSet.contains((key, diff))) {
+      largerLeafSet = largerLeafSet diff List((key, diff))
+      lenLargerLeafSet -= 1
+      existInLeafSet = true
+    }
 
-      if (leafId != null) {
-        if (leafId._1 < smallestLeafNodeId) {
-          smallestLeafNodeId = leafId._1
+    //updating smallest & largest nodeId in leafSet
+    if (existInLeafSet) {
+      if (nodeId == smallestLeafNodeId) {
+        if (lenSmallerLeafSet > 0) {
+          smallestLeafNodeId = smallerLeafSet(0)._1
+        } else if (lenLargerLeafSet > 0) {
+          smallestLeafNodeId = largerLeafSet(0)._1
+        } else {
+          smallestLeafNodeId = 0
         }
-        var diff = (Math.abs(nodeId - leafId._1)).toInt
-        smallerLeafSet(i) = (leafId._1, diff)
-
-        if (diff > proximityToClosestNode) {
-          index = i
+      } else if (nodeId == largestLeafNodeId) {
+        if (lenLargerLeafSet > 0) {
+          largestLeafNodeId = largerLeafSet(lenLargerLeafSet - 1)._1
+        } else if (lenSmallerLeafSet > 0) {
+          largestLeafNodeId = smallerLeafSet(lenSmallerLeafSet - 1)._1
+        } else {
+          largestLeafNodeId = 0
         }
+      }
+
+      if (key < nodeId) {
+        askLeafSetFromNode = smallestLeafNodeId
       } else {
-        lenSmallerLeafSet -= 1
+        askLeafSetFromNode = largestLeafNodeId
       }
     }
 
-    //updating larger leafset
-    for (i <- 0 until lenLargerLeafSet) {
-      var leafId = pSmallerLeafSet(i)
-      if (leafId != null) {
-        if (leafId._1 > largestLeafNodeId) {
-          largestLeafNodeId = leafId._1
+    return askLeafSetFromNode
+  }
+
+  def removeNodeFromRoutingTable(key: Int): Int = {
+    var askRoutingEntryFromNode: Int = 0
+    //update routing table entry
+    var sharedDigits = sharedPrefix(key)
+    if (sharedDigits < Constants.digits) {
+      //next digit in routing entry nodeId after the shared digits
+      var nextDigit = (((key / Math.pow(10, (Constants.digits - 1) - sharedDigits)).toInt) % 10).toInt
+      var pDiff = Math.abs(nodeId - key)
+
+      var routingEntry = routingTable(sharedDigits)(nextDigit)
+      if (routingEntry != null && routingEntry == Tuple2(key, pDiff)) {
+        routingTable(sharedDigits)(nextDigit) = null
+
+        breakable {
+          for (i <- 0 until Constants.numCols) {
+            if (routingTable(sharedDigits)(i) != null) {
+              askRoutingEntryFromNode = routingTable(sharedDigits)(i)._1
+              break
+            }
+          }
         }
 
-        var diff = (Math.abs(nodeId - leafId._1)).toInt
-        largerLeafSet(i) = (leafId._1, diff)
-
-        if (diff > proximityToClosestNode) {
-          index = i
-        }
-      } else {
-        lenLargerLeafSet -= 1
       }
     }
 
-    //finding the leaf node which is farthest from the closest node
-    //replace farthest node with the closest node
-    if (closestNodeId < nodeId) {
-      if (lenSmallerLeafSet < Constants.L / 2) {
-        smallerLeafSet(lenSmallerLeafSet) = (closestNodeId, proximityToClosestNode)
-        lenSmallerLeafSet += 1
-      } else if (index != -1) {
-        smallerLeafSet(index) = (closestNodeId, proximityToClosestNode)
-      }
-      if (closestNodeId < smallestLeafNodeId) {
-        smallestLeafNodeId = closestNodeId
-      }
-    } else {
-      if (lenLargerLeafSet < Constants.L / 2) {
-        largerLeafSet(lenLargerLeafSet) = (closestNodeId, proximityToClosestNode)
-        lenLargerLeafSet += 1
-      } else if (index != -1) {
-        largerLeafSet(index) = (closestNodeId, proximityToClosestNode)
-      }
-
-      if (closestNodeId > largestLeafNodeId) {
-        largestLeafNodeId = closestNodeId
-      }
-    }
-
-    //smallerLeafSet = smallerLeafSet.sortBy(_._1)
-    //largerLeafSet = largerLeafSet.sortBy(_._1)
+    return askRoutingEntryFromNode
   }
 
   def updateState(pNodeState: PastryNodeState) {
@@ -608,6 +735,16 @@ class PastryNodeState(pNodeId: Int) {
     return minKey
   }
 
+  def removeDeadNodeAndUpdateState(key: Int): Tuple2[Int, Int] = {
+    //removing node from leafset if exists
+    val askLeafSetFromNode = removeNodeFromLeafSet(key)
+    //removing node from routing table if exists
+    val askRoutingEntryFromNode = removeNodeFromRoutingTable(key)
+    //println(nodeId+" state after removing "+key)
+    //printState()
+    return (askLeafSetFromNode, askRoutingEntryFromNode)
+  }
+
   //this function will return number of keys shared between 2 keys
   def sharedPrefix(key: Int): Int = {
     var shared = 0
@@ -698,7 +835,7 @@ object NodeId {
   //key values will be from 1 to (2^16 - 1)
   var randomNumList: List[Int] = Random.shuffle((1 until Constants.keySpace).toList)
   //println("First element in random list: " + randomNumList(0))
-  var randomNumList2: List[Int] = Random.shuffle((1 until Constants.keySpace).toList)
+  var randomNumList2: List[Int] = (1 until Constants.keySpace).toList
 
   def randomId(): Int = {
     val randNum = randomNumList.head
